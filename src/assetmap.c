@@ -4,32 +4,39 @@
  * @date      2011
  * @copyright unlicense / public domain
  ****************************************************************************/
-#include <taaasset/assetmap.h>
-#include <taa/error.h>
-#include <taa/hash.h>
+#include <taa/assetmap.h>
+#include <taa/log.h>
 #include <taa/path.h>
 #include <assert.h>
 #include <stdlib.h>
 #include <string.h>
 
-//****************************************************************************
-static uint32_t taa_assetmap_search(
-    const taa_assetmap_key* keys,
-    uint32_t numkeys,
-    uint32_t packhash,
-    uint32_t filehash)
+struct taa_asset_map_s
 {
-    uint32_t lo = 0;
-    uint32_t hi = numkeys;
+    taa_asset_key* keys;
+    taa_asset_map_value* values;
+    uint32_t size;
+    uint32_t capacity;
+};
+
+//****************************************************************************
+static unsigned int taa_asset_map_search(
+    const taa_asset_key* keys,
+    unsigned int numkeys,
+    uint32_t groupkey,
+    uint32_t filekey)
+{
+    unsigned int lo = 0;
+    unsigned int hi = numkeys;
     while(lo < hi)
     {
-        uint32_t i = lo + ((hi-lo) >> 1);
-        const taa_assetmap_key* k = keys + i;
-        if(k->packhash < packhash)
+        unsigned int i = lo + ((hi-lo) >> 1);
+        const taa_asset_key* k = keys + i;
+        if(k->parts.group < groupkey)
         {
             lo = i + 1;
         }
-        else if(k->packhash == packhash && k->filehash < filehash)
+        else if(k->parts.group == groupkey && k->parts.file < filekey)
         {
             lo = i + 1;
         }
@@ -42,133 +49,137 @@ static uint32_t taa_assetmap_search(
 }
 
 //****************************************************************************
-void taa_assetmap_create(
-    taa_assetmap* mapout)
+void taa_asset_create_map(
+    uint32_t capacity,
+    taa_asset_map** map_out)
 {
-    memset(mapout, 0, sizeof(*mapout));
+    taa_asset_map* map;
+    map = (taa_asset_map*) calloc(1, sizeof(*map));
+    map->keys = (taa_asset_key*) malloc(capacity * sizeof(*map->keys));
+    map->values = (taa_asset_map_value*) malloc(capacity*sizeof(*map->values));
+    map->capacity = capacity;
+    *map_out = map;
 }
 
 //****************************************************************************
-void taa_assetmap_destroy(
-    taa_assetmap* map)
+void taa_asset_destroy_map(
+    taa_asset_map* map)
 {
     free(map->keys);
     free(map->values);
+    free(map);
 };
 
 //****************************************************************************
-int32_t taa_assetmap_find(
-    const taa_assetmap* map,
-    uint32_t packhash,
-    uint32_t filehash)
+taa_asset_map_value* taa_asset_find(
+    const taa_asset_map* map,
+    const taa_asset_key key)
 {
-    int32_t result = -1;
-    uint32_t i = taa_assetmap_search(
+    taa_asset_map_value* result = NULL;
+    uint32_t i = taa_asset_map_search(
         map->keys,
         map->size,
-        packhash,
-        filehash);
+        key.parts.group,
+        key.parts.file);
     if(i < map->size)
     {
-        const taa_assetmap_key* k = map->keys + i;
-        if(k->packhash == packhash && k->filehash == filehash)
+        if(map->keys[i].all == key.all)
         {
-            result = i;
+            result = map->values + i;
         }
     }
     return result;
 }
 
 //****************************************************************************
-void taa_assetmap_register(
-    taa_assetmap* map,
-    const taa_assetpack_list* assetpacks,
-    uint32_t typehash)
+void taa_asset_register_group(
+    taa_asset_map* map,
+    taa_asset_group* group,
+    uint32_t typekey)
 {
-    uint32_t n = 0;
-    const taa_assetpack* packitr = assetpacks->packs;
-    const taa_assetpack* packend = packitr + assetpacks->numpacks;
-    const taa_assetpack* prevpack = NULL;
-    // count the relevant number of files in every pack
-    while(packitr != packend)
+    uint32_t groupkey = group->key;
+    uint32_t n;
+    uint32_t total;
+    taa_asset_key* keyitr;
+    taa_asset_key* keydst;
+    taa_asset_map_value* valitr;
+    taa_asset_map_value* valdst;
+    taa_asset_file* fileitr;
+    taa_asset_file* fileend;
+    // count the relevant number of files in the group
+    fileitr = group->files;
+    fileend = fileitr+group->numfiles;
+    n = 0;
+    while(fileitr != fileend)
     {
-        const taa_assetpack_file* fileitr = packitr->base.files;
-        const taa_assetpack_file* fileend = fileitr+packitr->base.numfiles;
-        while(fileitr != fileend)
+        if(fileitr->typekey == typekey)
         {
-            if(fileitr->typehash == typehash)
-            {
-                ++n;
-            }
-            ++fileitr;
+            ++n;
         }
-        ++packitr;
+        ++fileitr;
     }
-    // allocate buffers
-    map->keys = (taa_assetmap_key*) malloc(n * sizeof(*map->keys));
-    map->values = (taa_assetmap_value*) malloc(n*sizeof(*map->values));
-    map->size = 0;
-    // loop through everything again and fill out the data
-    while(1)
+    total = map->size + n;
+    // ensure buffers have enough capacity
+    if(total > map->capacity)
     {
-        uint32_t hash = ~0;
-        taa_assetmap_key* keyitr = map->keys + map->size;
-        taa_assetmap_value* valueitr = map->values + map->size;
-        const taa_assetpack* pack = NULL;
-        const taa_assetpack_file* fileitr;
-        const taa_assetpack_file* fileend;
-        // the files are already sorted by hash within the asset packs
-        // but the packs themselves need to be sorted
-        packitr = assetpacks->packs;
-        if(prevpack == NULL)
-        {
-            while(packitr != packend)
-            {
-                uint32_t thash = packitr->base.namehash;
-                if (thash <= hash)
-                {
-                    hash = thash;
-                    pack = packitr;
-                }
-                ++packitr;
-            }
-        }
-        else
-        {
-            uint32_t prevhash = prevpack->base.namehash;
-            while(packitr != packend)
-            {
-                uint32_t thash = packitr->base.namehash;
-                if (thash > prevhash && thash <= hash)
-                {
-                    hash = thash;
-                    pack = packitr;
-                }
-                ++packitr;
-            }
-        }
-        if(pack == NULL)
-        {
-            break;
-        }
-        // after the next pack is selected, create entries for its files
-        fileitr = pack->base.files;
-        fileend = fileitr + pack->base.numfiles;
-        while(fileitr != fileend)
-        {
-            if(fileitr->typehash == typehash)
-            {
-                keyitr->packhash = pack->base.namehash;
-                keyitr->filehash = fileitr->filehash;
-                valueitr->pack = pack;
-                valueitr->file = (uint32_t) (fileitr - pack->base.files);
-                ++keyitr;
-                ++valueitr;
-                ++map->size;
-            }
-            ++fileitr;
-        }
-        prevpack = pack;
+        uint32_t sz;
+        uint32_t ncap = (total + 15) & ~15; // round to nearest 16
+        sz = ncap * sizeof(*map->keys);
+        map->keys = (taa_asset_key*) realloc(map->keys, sz);
+        sz = ncap * sizeof(*map->values);
+        map->values=(taa_asset_map_value*) realloc(map->values, sz);
+        map->capacity = ncap;
+        taa_LOG_WARN("asset map over capacity. resized to: %u", ncap);
     }
-    assert(map->size == n);
+    // make room to insert the nodes at the correct position
+    keyitr = map->keys + map->size;
+    keydst = map->keys + total - 1;
+    valitr = map->values + map->size;
+    valdst = map->values + total - 1;
+    while(keyitr != map->keys && keyitr->parts.group > groupkey)
+    {
+        *keydst = *keyitr;
+        *valdst = *valitr;
+        --keyitr;
+        --keydst;
+        --valitr;
+        --valdst;
+    }
+    // loop through the files again and insert the data
+    fileitr = group->files;
+    fileend = fileitr+group->numfiles;
+    n = 0;
+    while(fileitr != fileend)
+    {
+        if(fileitr->typekey == typekey)
+        {
+            taa_asset_key* key;
+            taa_asset_map_value* val;
+            uint32_t i;
+            i = taa_asset_map_search(keyitr,n,groupkey,fileitr->filekey);
+            // TODO: check for hash conflicts?
+            // make room for the file
+            key = keyitr + i;
+            val = valitr + i;
+            keydst = keyitr + n;
+            valdst = valitr + n;
+            while(keydst > key)
+            {
+                *keydst = keydst[-1];
+                *valdst = valdst[-1];
+                --keydst;
+                --valdst;
+            }
+            // insert the value
+            key->parts.group = groupkey;
+            key->parts.file = fileitr->filekey;
+            val->group = group;
+            val->file = fileitr;
+            val->asset = NULL;
+            ++n;
+        }
+        ++fileitr;
+    }
+    map->size += n;
+    assert(map->size == total);
 }
